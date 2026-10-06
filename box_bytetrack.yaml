@@ -1,0 +1,9 @@
+# ByteTrack settings tuned for boxes that briefly disappear near the count line.
+# track_buffer is measured in processed/inference frames, not camera frames.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 150
+match_thresh: 0.85
+fuse_score: true
