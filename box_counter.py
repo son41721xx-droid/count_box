@@ -1,4 +1,4 @@
-"""Count tracked boxes crossing an adjustable horizontal line in an RTSP stream."""
+"""Count tracked boxes entering or leaving an adjustable four-point area."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ os.environ.setdefault(
 )
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -25,43 +26,76 @@ WINDOW_NAME = "YOLO Box Counter"
 
 @dataclass
 class TrackState:
-    """Last stable side of the line occupied by one tracked object."""
+    """Last stable area membership of one tracked object."""
 
-    side: int
+    inside: bool
     last_seen: int
 
 
-class AdjustableLine:
-    def __init__(self, initial_ratio: float = 0.75) -> None:
-        self.ratio = max(0.05, min(0.95, initial_ratio))
-        self.y = 0
+class AdjustableArea:
+    DEFAULT_RATIOS = (
+        (0.20, 0.55),
+        (0.80, 0.55),
+        (0.80, 0.90),
+        (0.20, 0.90),
+    )
+
+    def __init__(self) -> None:
+        self.ratios = list(self.DEFAULT_RATIOS)
+        self.points: list[tuple[int, int]] = []
+        self.frame_width = 0
         self.frame_height = 0
-        self.dragging = False
+        self.dragging_index: int | None = None
         self.changed = False
 
-    def update_frame_height(self, height: int) -> None:
-        if height != self.frame_height:
+    def update_frame_size(self, width: int, height: int) -> None:
+        if width != self.frame_width or height != self.frame_height:
+            self.frame_width = width
             self.frame_height = height
-            self.y = int(height * self.ratio)
+            self.points = [
+                (int(width * x_ratio), int(height * y_ratio))
+                for x_ratio, y_ratio in self.ratios
+            ]
 
-    def move_to(self, y: int) -> None:
-        if self.frame_height <= 0:
+    def move_point(self, index: int, x: int, y: int) -> None:
+        if self.frame_width <= 0 or self.frame_height <= 0:
             return
-        new_y = max(0, min(self.frame_height - 1, y))
-        if new_y != self.y:
-            self.y = new_y
-            self.ratio = self.y / self.frame_height
+        x = max(0, min(self.frame_width - 1, x))
+        y = max(0, min(self.frame_height - 1, y))
+        if self.points[index] != (x, y):
+            self.points[index] = (x, y)
+            self.ratios[index] = (x / self.frame_width, y / self.frame_height)
             self.changed = True
 
-    def mouse_callback(self, event: int, _x: int, y: int, _flags: int, _param) -> None:
-        if event == cv2.EVENT_LBUTTONDOWN and abs(y - self.y) <= 20:
-            self.dragging = True
-        elif event == cv2.EVENT_MOUSEMOVE and self.dragging:
-            self.move_to(y)
+    def reset(self) -> None:
+        self.ratios = list(self.DEFAULT_RATIOS)
+        if self.frame_width > 0 and self.frame_height > 0:
+            self.points = [
+                (int(self.frame_width * x_ratio), int(self.frame_height * y_ratio))
+                for x_ratio, y_ratio in self.ratios
+            ]
+        self.changed = True
+
+    @property
+    def contour(self) -> np.ndarray:
+        points = np.asarray(self.points, dtype=np.int32)
+        center = points.mean(axis=0)
+        angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+        points = points[np.argsort(angles)]
+        return points.reshape((-1, 1, 2))
+
+    def mouse_callback(self, event: int, x: int, y: int, _flags: int, _param) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN and self.points:
+            distances = [((px - x) ** 2 + (py - y) ** 2) ** 0.5 for px, py in self.points]
+            nearest = int(np.argmin(distances))
+            if distances[nearest] <= 25:
+                self.dragging_index = nearest
+        elif event == cv2.EVENT_MOUSEMOVE and self.dragging_index is not None:
+            self.move_point(self.dragging_index, x, y)
         elif event == cv2.EVENT_LBUTTONUP:
-            if self.dragging:
-                self.move_to(y)
-            self.dragging = False
+            if self.dragging_index is not None:
+                self.move_point(self.dragging_index, x, y)
+            self.dragging_index = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,16 +133,10 @@ def parse_args() -> argparse.Namespace:
         help="Use FP16 inference (recommended with an NVIDIA GPU)",
     )
     parser.add_argument(
-        "--line-ratio",
-        type=float,
-        default=0.75,
-        help="Initial line position as fraction of image height (0-1)",
-    )
-    parser.add_argument(
         "--hysteresis",
         type=int,
         default=12,
-        help="Pixels on each side of the line ignored to reduce jitter",
+        help="Pixels around the area boundary ignored to reduce count jitter",
     )
     parser.add_argument(
         "--class-id",
@@ -237,13 +265,16 @@ class LatestFrameReader:
             cap.release()
 
 
-def stable_side(center_y: int, line_y: int, margin: int) -> int:
-    """Return -1 above, +1 below, or 0 inside the dead band."""
-    if center_y < line_y - margin:
-        return -1
-    if center_y > line_y + margin:
-        return 1
-    return 0
+def stable_area_membership(
+    point: tuple[int, int], contour: np.ndarray, margin: int
+) -> bool | None:
+    """Return True inside, False outside, or None inside the boundary dead band."""
+    distance = cv2.pointPolygonTest(contour, point, True)
+    if distance > margin:
+        return True
+    if distance < -margin:
+        return False
+    return None
 
 
 def main() -> None:
@@ -257,14 +288,14 @@ def main() -> None:
         )
 
     model = YOLO(str(model_path))
-    line = AdjustableLine(args.line_ratio)
+    area = AdjustableArea()
     track_states: dict[int, TrackState] = {}
-    down_count = 0
-    up_count = 0
+    enter_count = 0
+    exit_count = 0
     frame_number = 0
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(WINDOW_NAME, line.mouse_callback)
+    cv2.setMouseCallback(WINDOW_NAME, area.mouse_callback)
 
     reader = LatestFrameReader(source, args.reconnect_after).start()
     last_sequence = 0
@@ -286,12 +317,12 @@ def main() -> None:
 
             frame_number += 1
             height, width = frame.shape[:2]
-            line.update_frame_height(height)
+            area.update_frame_size(width, height)
 
-            # Moving the line must not create artificial crossings.
-            if line.changed:
+            # Moving the area must not create artificial enter/exit events.
+            if area.changed:
                 track_states.clear()
-                line.changed = False
+                area.changed = False
 
             results = model.track(
                 frame,
@@ -308,6 +339,26 @@ def main() -> None:
 
             result = results[0]
             boxes = result.boxes
+
+            # Draw the editable area before boxes so live detections stay clear.
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [area.contour], (0, 0, 255))
+            cv2.addWeighted(overlay, 0.14, frame, 0.86, 0, frame)
+            cv2.polylines(frame, [area.contour], True, (0, 0, 255), 3)
+            for index, (point_x, point_y) in enumerate(area.points, start=1):
+                cv2.circle(frame, (point_x, point_y), 9, (0, 255, 255), -1)
+                cv2.circle(frame, (point_x, point_y), 11, (0, 0, 255), 2)
+                cv2.putText(
+                    frame,
+                    f"P{index}",
+                    (point_x + 12, point_y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
             if boxes is not None and boxes.id is not None:
                 coordinates = boxes.xyxy.int().cpu().tolist()
                 track_ids = boxes.id.int().cpu().tolist()
@@ -319,16 +370,18 @@ def main() -> None:
                 ):
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
-                    side = stable_side(center_y, line.y, args.hysteresis)
+                    inside = stable_area_membership(
+                        (center_x, center_y), area.contour, max(0, args.hysteresis)
+                    )
                     previous = track_states.get(track_id)
 
-                    if side != 0:
-                        if previous is not None and previous.side != side:
-                            if previous.side == -1 and side == 1:
-                                down_count += 1
-                            elif previous.side == 1 and side == -1:
-                                up_count += 1
-                        track_states[track_id] = TrackState(side, frame_number)
+                    if inside is not None:
+                        if previous is not None and previous.inside != inside:
+                            if inside:
+                                enter_count += 1
+                            else:
+                                exit_count += 1
+                        track_states[track_id] = TrackState(inside, frame_number)
                     elif previous is not None:
                         previous.last_seen = frame_number
 
@@ -354,31 +407,33 @@ def main() -> None:
                 if frame_number - state.last_seen <= 300
             }
 
-            net_count = down_count - up_count
-            cv2.line(frame, (0, line.y), (width - 1, line.y), (0, 0, 255), 3)
+            net_count = enter_count - exit_count
             cv2.putText(
                 frame,
-                "Drag red line with mouse",
-                (15, max(25, line.y - 12)),
+                "Drag yellow points P1-P4 to adjust area",
+                (15, height - 45),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
-                (0, 0, 255),
+                (0, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
-            cv2.rectangle(frame, (10, 10), (190, 120), (20, 20, 20), -1)
-            cv2.putText(frame, f"DOWN  +1: {down_count}", (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-            cv2.putText(frame, f"UP    -1: {up_count}", (25, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 2)
+            cv2.rectangle(frame, (10, 10), (240, 120), (20, 20, 20), -1)
+            cv2.putText(frame, f"ENTER +1: {enter_count}", (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+            cv2.putText(frame, f"EXIT  -1: {exit_count}", (25, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 2)
             cv2.putText(frame, f"TOTAL    : {net_count}", (25, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-            cv2.putText(frame, "Q: quit   R: reset", (10, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(frame, "Q: quit   R: reset count   A: reset area", (10, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key == ord("r"):
-                down_count = 0
-                up_count = 0
+                enter_count = 0
+                exit_count = 0
+                track_states.clear()
+            if key == ord("a"):
+                area.reset()
                 track_states.clear()
     finally:
         reader.close()
