@@ -5,6 +5,7 @@
 - จุดกึ่งกลางกล่องเคลื่อนจากนอกเข้า Area: `+1`
 - จุดกึ่งกลางกล่องเคลื่อนจากในออก Area: `-1`
 - ลากจุดสีเหลือง `P1-P4` เพื่อปรับ Area สี่เหลี่ยม
+- โปรแกรมบันทึกตำแหน่ง `P1-P4` ลง `area_config.json` หลังปล่อยเมาส์ และโหลดกลับให้อัตโนมัติเมื่อเปิดครั้งถัดไป
 - กด `R` เพื่อล้างตัวนับ, `A` คืน Area เริ่มต้น และ `Q` หรือ `Esc` เพื่อออก
 
 ## ติดตั้งและรันใน VS Code บน Windows
@@ -43,6 +44,56 @@ python box_counter.py
 python box_counter.py --conf 0.45 --imgsz 640
 ```
 
+หากต้องการเก็บตำแหน่ง Area ไว้ในไฟล์อื่น ให้ระบุเส้นทางด้วย `--area-config`:
+
+```powershell
+python box_counter.py --area-config camera01_area.json
+```
+
+ปุ่ม `A` จะคืน Area เริ่มต้นและบันทึกค่าเริ่มต้นนั้นลงไฟล์ด้วย
+
+## แสดงเลข Order จาก Dock API
+
+โปรแกรมเรียก `https://pwdapi.fec-corp.com/api/asrs/dock-front?dock=DOCK03`
+ทุก 10 วินาที ดึง `order_no` ที่ไม่เป็นค่าว่างจาก `lanes` ตัดเลขซ้ำ และแสดงบนวิดีโอ
+ตัวนับและเลข Order จะแสดงในแถบสถานะเหนือภาพกล้อง จึงไม่บังวัตถุในวิดีโอ
+ให้กำหนด Bearer Token ใน environment variable ก่อนรัน เพื่อไม่เก็บ Token ลงในโค้ด:
+
+```powershell
+$env:DOCK_API_TOKEN = "YOUR_BEARER_TOKEN"
+.\.venv\Scripts\python.exe box_counter.py
+```
+
+เปลี่ยนช่วงเวลาเรียก API หรือ URL ได้ เช่น:
+
+```powershell
+.\.venv\Scripts\python.exe box_counter.py --api-refresh 30 --api-url "https://pwdapi.fec-corp.com/api/asrs/dock-front?dock=DOCK03"
+```
+
+ถ้าไม่กำหนด `DOCK_API_TOKEN` วิดีโอยังทำงานตามปกติ แต่จะแสดงสถานะ `NO TOKEN`
+
+เมื่ออ่าน Order ได้ โปรแกรมจะยึด `order_no` ตัวแรกไว้ตลอดการรัน และเมื่อ `TOTAL`
+เปลี่ยนจะส่งค่าล่าสุดไปที่ `POST /api/asrs/dock-front/box-counts` ในรูปแบบ:
+
+```json
+{
+  "order_no": "6100235059",
+  "boxes": "9999"
+}
+```
+
+การ POST ทำงานใน thread แยก หากส่งไม่สำเร็จจะลองใหม่ทุก 5 วินาทีและเก็บเฉพาะ
+ค่า `TOTAL` ล่าสุด สถานะ `POST:OK`, `POST:HTTP 401` หรือ `POST:ERROR` จะแสดงบนแถบด้านบน
+สามารถเปลี่ยนปลายทางและเวลาลองใหม่ด้วย `--box-count-url` และ `--post-retry`
+
+หาก API ตอบสำเร็จและ `order_no` ของทุก lane เป็น `null` ต่อเนื่องอย่างน้อย 10 วินาที
+โปรแกรมจะล้าง `ENTER`, `EXIT`, `TOTAL` และปลด Order เดิม จากนั้นรอรับ Order ใหม่
+กรณีเครือข่ายขัดข้อง, HTTP error หรือ Token ผิดจะไม่ทำให้ยอดถูก reset ปรับเวลาได้ด้วย:
+
+```powershell
+.\.venv\Scripts\python.exe box_counter.py --null-reset-after 10
+```
+
 ถ้าโมเดลมีหลายคลาสและต้องการนับเฉพาะคลาสกล่อง สมมติกล่องเป็น class ID 0:
 
 ```powershell
@@ -58,7 +109,7 @@ python box_counter.py --class-id 0
 หากมี NVIDIA GPU ให้รันด้วย CUDA และ FP16:
 
 ```powershell
-python box_counter.py --username admin --device 0 --half
+python box_counter.py --username admin --device 0 --quantize 16
 ```
 
 หากใช้ CPU และภาพยังช้า ให้ลดขนาด inference:
